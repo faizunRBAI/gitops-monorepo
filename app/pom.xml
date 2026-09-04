@@ -30,42 +30,73 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <!--
-      CVE PATCH LEVELS — these override the versions the Boot 3.3.5 BOM pins.
+      ============================================================
+      CVE PATCH LEVELS — these override the versions Boot 3.3.5 pins.
+      ============================================================
 
-      WHY THESE EXIST: Boot 3.3.5 was released in Nov 2024. Its BOM freezes
-      tomcat-embed and spring-framework at that date, and the image scan
-      (HIGH/CRITICAL, fixed-only, before push) found accumulated advisories
-      against both:
+      WHY: Boot 3.3.5 was released Nov 2024; its BOM freezes these trees at
+      that date. The image scan (HIGH/CRITICAL, fixed-only, before push) found
+      ~2 years of accumulated advisories:
 
-        tomcat-embed-core   CVE-2024-50379  RCE, TOCTOU in JSP compilation
-                            CVE-2024-56337  incomplete fix for the above
-                            CVE-2025-48988  DoS, multipart upload
-                            CVE-2025-48989  DoS, HTTP/2 "MadeYouReset"
-                            CVE-2025-52520  DoS
-                            CVE-2025-53506  DoS
-                            CVE-2025-55752  directory traversal, possible RCE
-                            CVE-2026-24734  certificate revocation bypass
-        spring-expression   CVE-2026-41850  DoS via crafted SpEL
-        spring-webmvc       CVE-2026-41842  DoS resolving static resources
-                            CVE-2026-41845  XSS, incorrect JavaScript escaping
+        tomcat-embed-core   CVE-2024-50379 / -56337  RCE, TOCTOU in JSP compilation
+                            CVE-2025-48988           DoS, multipart upload
+                            CVE-2025-48989           DoS, HTTP/2 "MadeYouReset"
+                            CVE-2025-52520 / -53506  DoS
+                            CVE-2025-55752           directory traversal, possible RCE
+                            CVE-2026-24734           certificate revocation bypass
+        spring-expression   CVE-2026-41850           DoS via crafted SpEL
+        spring-webmvc       CVE-2026-41842           DoS resolving static resources
+                            CVE-2026-41845           XSS, incorrect JavaScript escaping
 
-      WHY OVERRIDE PROPERTIES RATHER THAN BUMP THE PARENT: moving to a newer
-      Boot minor would pull these transitively, but this repo has already lost
-      three CI attempts to asserting external version identifiers that could
-      not be verified from the build environment. These two numbers were NOT
-      guessed — Trivy printed them itself in the "Fixed Version" column of the
-      failing run. Overriding the Boot BOM's own properties is the supported
-      mechanism (spring-boot-dependencies declares both), so the whole
-      dependency tree moves coherently and requireUpperBoundDeps in the lint
-      stage will fail the build if anything is left behind.
+      THESE THREE MOVE TOGETHER — DO NOT BUMP ONE ALONE.
+      Boot's BOM keeps Spring Framework and Micrometer in lockstep. A previous
+      attempt raised spring-framework to 6.2.19 while leaving micrometer at the
+      BOM's 1.13.6; requireUpperBoundDeps failed in the lint stage because
+      spring-web 6.2.19 requires micrometer-observation 1.15.12. Overriding
+      half of a coordinated version set is what causes that.
 
-      MAINTENANCE: when the parent is next raised, DELETE these two
-      properties rather than carrying them forward — a stale downgrade-pin is
-      worse than none. The lint stage's enforcer catches the conflict.
+      EVERY VERSION HERE CAME FROM TOOL OUTPUT, NOT FROM MEMORY:
+        - 10.1.52 and 6.2.19 — Trivy's "Fixed Version" column
+        - 1.15.12            — the enforcer's own convergence report
+      This repo has lost attempts to unverifiable external identifiers; taking
+      the number from the tool that demanded it is the only safe source.
+
+      MAINTENANCE: when the parent is next raised, DELETE all three properties
+      and the dependencyManagement block below rather than carrying them
+      forward — a stale downgrade-pin is worse than none. The enforcer in the
+      lint stage will flag the conflict if they are left behind.
     -->
     <tomcat.version>10.1.52</tomcat.version>
     <spring-framework.version>6.2.19</spring-framework.version>
+    <micrometer.version>1.15.12</micrometer.version>
   </properties>
+
+  <!--
+    BELT AND BRACES. The properties above are the supported override mechanism
+    and should be sufficient on their own. This block pins the same artifacts
+    explicitly so the build does not depend on the property NAME being right —
+    if a property is spelled differently in this Boot line, the version here
+    still wins, and if the properties work this block is simply redundant.
+    Cheap insurance on a build that can only be exercised in CI.
+  -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-bom</artifactId>
+        <version>${micrometer.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-framework-bom</artifactId>
+        <version>${spring-framework.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
