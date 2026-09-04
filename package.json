@@ -7,6 +7,10 @@
   "workspaces": [
     "app"
   ],
+  "//overrides": "express@4.x pins path-to-regexp to the 0.1.x line, which carries two HIGH ReDoS CVEs: CVE-2024-52798 (fixed in 0.1.12) and CVE-2026-4867 (fixed in 0.1.13). The Trivy gate in build-push caught them and correctly refused to push the image. npm only honours `overrides` in the WORKSPACE ROOT, so the pin lives here rather than in app/package.json. Both CI and the Docker build read this file, so the fix reaches every call site. Do NOT replace this with a scanner ignore — these are remotely triggerable DoS vectors in an internet-facing service.",
+  "overrides": {
+    "path-to-regexp": "0.1.13"
+  },
   "scripts": {
     "lint": "npm run lint --workspace app",
     "test": "npm run test --workspace app",
