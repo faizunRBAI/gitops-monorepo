@@ -3,7 +3,7 @@
 dev: Developer { shape: person; udap-type: generic.user }
 ops: Operator { shape: person; udap-type: generic.user }
 gh: GitHub Monorepo (app/ chart/ gitops/) { shape: cylinder; udap-type: generic.app }
-ci: CI Pipeline (GitHub Actions) { udap-type: generic.app }
+ci: CI Pipeline (Maven verify + Trivy) { udap-type: generic.app }
 ecr: ECR (scan-on-push) { udap-type: aws.ecr }
 vpc: VPC 2 AZs us-east-1 {
   nlb: NLB { udap-type: aws.alb }
@@ -11,7 +11,7 @@ vpc: VPC 2 AZs us-east-1 {
   eks: EKS 1.33 Node Group { udap-type: aws.eks }
   argocd: ArgoCD + Application objects { udap-type: generic.app }
   rollouts: Argo Rollouts { udap-type: generic.app }
-  app: App (canary / bluegreen / plain) { udap-type: generic.app }
+  app: Spring Boot 3 (canary / bluegreen / plain) { udap-type: generic.app }
   prom: Prometheus { udap-type: generic.app }
   graf: Grafana { udap-type: generic.app }
   labelsync: label-sync CronJob { udap-type: generic.app }
@@ -28,7 +28,7 @@ vpc.argocd -> vpc.labelsync: sync label-sync
 vpc.rollouts -> vpc.app: canary steps
 vpc.app -> ecr: pull image
 vpc.prom -> vpc.argocd: scrape controller metrics
-vpc.prom -> vpc.app: scrape app metrics
+vpc.prom -> vpc.app: scrape Actuator /metrics
 vpc.prom -> vpc.graf: datasource
 vpc.labelsync -> vpc.argocd: patch image label
 vpc.eks -> vpc.app: hosts

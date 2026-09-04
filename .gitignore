@@ -1,24 +1,49 @@
-# Node
-node_modules/
-dist/
-coverage/
-npm-debug.log*
+# ---- Java / Maven ----
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
 
-# Terraform — never commit state or local overrides
+# ---- Terraform ----
+# State never belongs in Git: this project uses the platform-managed remote
+# backend (TF_STATE_BUCKET), and a committed local state would be a stale
+# second source of truth.
 .terraform/
 .terraform.lock.hcl
 *.tfstate
 *.tfstate.*
-*.tfvars
-!*.tfvars.example
 crash.log
+*.tfvars
+*.tfvars.json
+!example.tfvars
 
-# Local env
+# ---- secrets ----
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+kubeconfig
+kubeconfig.*
 
-# Editors / OS
-.DS_Store
+# ---- IDEs ----
 .idea/
+*.iws
+*.iml
+*.ipr
 .vscode/
+.classpath
+.project
+.settings/
+.apt_generated
+.factorypath
+.springBeans
+.sts4-cache
+/nbproject/private/
+/nbbuild/
+/nbdist/
+/.nb-gradle/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db

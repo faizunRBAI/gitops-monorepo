@@ -1,116 +1,156 @@
 # gitops-monorepo
 
-One repository holding the application, its Helm chart, all cluster configuration, and the
-CI/CD pipeline. ArgoCD reconciles the cluster to Git; the pipeline builds and feeds versions
-in. Gradual releases via Argo Rollouts, one-click rollback, everything watched on Grafana.
+A GitOps delivery platform where **application code, Helm chart, cluster
+configuration and CI/CD all live in one repository** — with the loop risks that
+normally creates designed out rather than documented away.
+
+Spring Boot 3 / Java 21 on EKS, delivered by ArgoCD with Argo Rollouts doing
+canary and blue/green.
+
+---
+
+## The four invariants
+
+This design has one genuinely hard problem: ArgoCD watches the same repository
+the pipeline commits to. Get that wrong and you get a loop, or `selfHeal`
+reverting your deploys. Four rules prevent it, and **all four are enforced by
+CI, not by convention.**
+
+| # | Rule | Enforced by |
+|---|------|-------------|
+| 1 | ArgoCD watches **only** `gitops/` — never `app/`, `chart/` or `.github/` | `security` stage fails if any Application's `path:` is under `app/` or `.github/` |
+| 2 | Image tags are **ArgoCD Helm parameters**, never committed chart values | `security` stage fails on a committed `image.tag` in `gitops/apps` |
+| 3 | CI builds only from `app/` + `chart/` | `detect-changes` classifies paths; `gitops/**`-only changes build nothing |
+| 4 | `selfHeal: true` is therefore safe | `verify` re-checks `Synced` **60s after** the deploy patch |
+
+Rule 2 is the load-bearing one. A deploy changes **cluster state, not Git**:
+the pipeline patches `spec.source.helm.parameters` on the live Application.
+There is nothing in Git for ArgoCD to fight.
+
+## Layout
 
 ```
-app/                      application source + Dockerfile        <- CI builds this
-chart/app/                the Helm chart (3 release modes)       <- CI builds this
-gitops/
-  root-app.yaml           the single bootstrap Application
-  apps/                   app-of-apps: one Application per component
-  observability/          kube-prometheus-stack values
-  dashboards/             Grafana dashboards as ConfigMaps
-  scrapes/                ServiceMonitors (incl. ArgoCD's own)
-  label-sync/             the console label-accuracy CronJob
-infra/                    Terraform: VPC, EKS, ECR, and the one bootstrap step
-.udap/pipeline.yaml       pipeline spec -> renders .github/workflows/
+app/                  Spring Boot 3 service (Maven, self-contained)
+chart/app/            one chart, three release modes
+gitops/               everything ArgoCD manages
+  root-app.yaml         the single bootstrap object
+  apps/                 app-of-apps: one Application per component
+  observability/        kube-prometheus-stack values
+  dashboards/           Grafana dashboards as ConfigMaps
+  scrapes/              ServiceScrapes (incl. ArgoCD's own metrics)
+  label-sync/           CronJob keeping the console's image label honest
+flux/                 scaffolded, NOT installed (see below)
+infra/                Terraform: VPC, EKS, ECR, and the one bootstrap step
+.udap/                architecture source of truth + pipeline spec
 ```
 
-## The four rules that keep a monorepo from eating itself
+## How a deploy actually works
 
-The risk of putting CI and GitOps in one repo is that they fight: the pipeline commits,
-ArgoCD reconciles, `selfHeal` reverts, something retriggers. Four rules remove it.
+```
+push to app/ or chart/
+  └─ detect-changes → lint → test → security
+       └─ build-push   build image, scan it, THEN push (never a vulnerable image)
+            └─ provision   terraform apply
+                 └─ configure   capture previous tag
+                                patch Application's image.tag parameter
+                                hard-refresh ArgoCD
+                      └─ verify   Synced + Healthy
+                                  running image == the tag this run built
+                                  ArgoCD metrics scrapeable
+                                  STILL Synced 60s later  ← rule 4
+                                  /api/info reports the new tag through the ingress
+                           └─ rollback (manual approval)
+```
 
-**1. ArgoCD watches only `gitops/`.** Never `app/`, `chart/`, or `.github/`. A code change is
-invisible to ArgoCD until the pipeline deploys it.
+### Rollback
 
-**2. Image tags are ArgoCD Helm parameters, not committed chart values.** The pipeline sets
-the tag by patching the live `Application` object's `spec.source.helm.parameters`. A deploy
-changes *cluster state, not Git*.
+Not a `git revert` — nothing was committed, so there is nothing to revert.
+`configure` captures the previous tag before patching; the gated `rollback`
+stage rewinds the Rollout to the previous ReplicaSet's image. `gitops/` is
+untouched, so `selfHeal` stays quiet throughout.
 
-**3. The pipeline builds only from `app/` and `chart/`.** The `detect-changes` stage
-classifies the diff; a change confined to `gitops/` is applied by ArgoCD, not by CI.
+## The application
 
-**4. Therefore `selfHeal: true` is safe.** The only thing ArgoCD manages is `gitops/`, and the
-pipeline never writes there. There is nothing to fight.
+Deliberately small — this repository is about the delivery platform, not the
+app. It exists to make a rollout *visible*.
 
-Break rule 2 and you get the loop the other three exist to prevent. The `security` stage fails
-the build if a committed `image.tag` ever appears in `gitops/apps/`, and the `verify` stage
-re-checks `Synced` a minute after the patch to prove selfHeal didn't revert it.
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | Landing page showing the live version, release mode and pod |
+| `GET /api/info` | The same three facts as JSON — what `verify` asserts against |
+| `GET /healthz` | Actuator health — what the chart's probes hit |
+| `GET /metrics` | Prometheus — what the ServiceScrapes read |
 
-## What rollback actually is
+`/healthz` and `/metrics` are **Actuator remapped**, not the `/actuator/**`
+defaults. That keeps the chart, the scrapes and the verify stage identical to
+what they were before the runtime changed. A `security`-stage guard fails the
+build if that mapping is removed.
 
-Not a git revert. Nothing was committed, so there is nothing to revert.
-
-The `configure` stage captures the currently-deployed tag *before* patching. The `rollback`
-stage — manual approval, never automatic — rewinds the Rollout to its previous revision.
-One click, cluster state only, `gitops/` untouched.
+`APP_VERSION`, `RELEASE_MODE` and `POD_NAME` are injected by the chart, so the
+page is direct evidence of which deploy is serving you — during a canary you
+can watch the version flip on refresh.
 
 ## Release modes
 
 One chart, three modes, mutually exclusive:
 
-| Environment | Mode | Sync |
-|---|---|---|
-| `app-dev` | plain Deployment | manual |
-| `app-bluegreen` | blue/green Rollout, manual promotion | automated |
-| `app-canary` | canary Rollout: 20% → 50% → 80% with pauses | automated |
-
-The plain `Deployment` template renders **only** when both mode switches are off — otherwise
-two controllers would own the same pods. The `security` stage renders all three modes and
-fails if a Deployment leaks into a Rollout mode, and fails again if both modes are set at once.
-
-## Bootstrap
-
-ArgoCD cannot install itself from a repo it has not read yet, so exactly one step is
-imperative. Terraform does it, in the `provision` stage:
-
-1. `helm_release` ArgoCD (+ `server.insecure`, since ingress terminates TLS)
-2. `helm_release` Argo Rollouts
-3. `helm_release` ingress-nginx (NLB)
-4. apply `gitops/root-app.yaml` — the root app-of-apps
-
-Everything after that is reconciled by ArgoCD from `gitops/apps/`.
-
-`gitops/apps/` is a Helm chart rather than plain YAML because two values are unknowable until
-the cluster exists: this repo's URL and the ECR URL (which embeds the account id). Terraform
-passes them as parameters on the root Application. The alternative — having the pipeline patch
-them in later — would write into `gitops/` and break rule 4.
-
-The root Application is applied with the `kubectl` provider, not `kubernetes_manifest`: the
-latter validates CRD schemas at *plan* time and so cannot create a resource whose CRD does not
-exist yet, which is exactly the first-apply case.
-
-## Operating it
-
 ```bash
-aws eks update-kubeconfig --region us-east-1 --name <project>
-
-kubectl get applications -n argocd            # what ArgoCD thinks
-kubectl argo rollouts get rollout app -n app-canary --watch
-kubectl argo rollouts promote app -n app-canary     # skip a canary pause
-kubectl argo rollouts undo app -n app-canary        # what the rollback stage runs
+helm template chart/app --set canary.enabled=true       # canary Rollout
+helm template chart/app --set blueGreen.enabled=true    # blue/green Rollout
+helm template chart/app                                 # plain Deployment
 ```
 
-Console at `/argocd`, dashboards at `/grafana` on the ingress hostname.
+Setting both **aborts the render** rather than producing two Rollouts with the
+same name. The plain Deployment renders only when both are off — otherwise two
+controllers would own the same selector and the canary would never converge.
 
-Initial passwords (never committed):
+## Five traps this design handles
+
+1. **Silent registry tag overwrite** — immutable `git-<sha>` tags, ECR set to
+   `IMMUTABLE`, the build refuses a tag that already exists, and
+   `imagePullPolicy: Always` as a second line of defence.
+2. **ArgoCD ships no controller-metrics Service** — one is added, with a
+   ServiceMonitor, so the delivery system itself is observable.
+3. **Stale console image label** — an every-minute CronJob reconciles it.
+4. **Distroless has no shell** — the label-sync CronJob uses `bitnami/kubectl`.
+5. **Plain-Deployment guard** — renders only when both mode switches are false.
+
+## Base image
+
+`eclipse-temurin:21-jre-jammy`, **not** distroless, and that is deliberate.
+
+`gcr.io/distroless/java21-debian12` carries the same Debian 12 package set that
+blocked an earlier image on three HIGH OpenSSL CVEs — and distroless has no
+package manager, so they cannot be patched from a Dockerfile. Jammy lets
+`apt-get upgrade` fix them at build time. The cost is a shell in the image,
+mitigated by a non-root user (UID 65532) and a read-only root filesystem.
+
+The image is scanned **before** it is pushed, at HIGH/CRITICAL, so a vulnerable
+image never reaches the registry.
+
+## Flux
+
+Scaffolded under `flux/`, **not installed**. ArgoCD's "patch the object" model
+keeps deploys out of Git entirely; Flux's "commit the tag to Git" model is the
+one case needing a `[skip ci]` guard. Running one engine is simpler to keep
+loop-free.
+
+The trigger exclusions and `[skip ci]` discipline are already correct, so
+enabling Flux later is additive — see `flux/README.md`.
+
+## Local development
+
 ```bash
-kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d
-kubectl get secret observability-grafana -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d
+cd app
+mvn spring-boot:run          # http://localhost:8080
+mvn -B verify                # the same command CI runs
 ```
 
-## Deliberate trade-offs
+## Cost
 
-- **Single NAT gateway**, not one per AZ. Saves ~£30/mo; losing that AZ removes egress for
-  private subnets in both.
-- **No Alertmanager.** Nothing to route alerts to yet, so running it would only cost memory
-  and imply coverage that doesn't exist.
-- **No database.** None was required. Adding one is additive.
-- **HTTP, not HTTPS.** No domain was supplied. cert-manager + a real hostname is the next step.
-- **Flux is not installed.** See `flux/README.md`.
+Roughly **£200–280/month**: EKS control plane (~£58 regardless of load), three
+`t3.large` nodes, one NAT gateway, an NLB, and EBS volumes for Prometheus and
+Grafana.
 
-Running cost is roughly **£200–280/mo**, accruing from the moment `provision` goes green. The
-EKS control plane alone is ~£58/mo whether or not anything runs on it.
+A single NAT gateway is a deliberate Tier-appropriate trade: it saves ~£30/mo
+versus one per AZ, at the cost of egress depending on one AZ.

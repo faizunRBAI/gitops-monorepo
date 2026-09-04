@@ -1,19 +1,17 @@
-# The build context is the repository root (see app/Dockerfile), so everything
-# that is not needed to build the app image is excluded here.
+# The build context is ./app (see the build-push stage). Everything the image
+# does not need is excluded so context uploads stay small and a stale local
+# build never leaks into the image.
+target/
 .git
+.gitignore
 .github
 .udap
 infra
 gitops
-chart
 flux
-node_modules
-app/node_modules
-app/dist
-app/coverage
-app/test
+chart
+README.md
 **/*.md
-.gitignore
-.env
-.env.*
-npm-debug.log*
+.idea
+.vscode
+.DS_Store

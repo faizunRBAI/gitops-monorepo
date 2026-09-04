@@ -38,34 +38,50 @@ stages:
   - id: lint
     kind: lint
     needs: [detect-changes]
-    timeout_minutes: 10
+    timeout_minutes: 15
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-java@v4
         with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - name: Install (npm workspace root)
-        run: npm ci
-      - name: Lint
-        run: npm run lint
-      - name: Typecheck
-        run: npm run build --workspace app
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Compile (javac IS the typecheck)
+        working-directory: app
+        run: mvn -B -ntp clean compile
+      - name: Enforce a reproducible dependency tree
+        working-directory: app
+        run: |
+          set -euo pipefail
+          # Fails on a dependency declared at two different versions, which is
+          # how a transitive CVE quietly reappears after someone adds a starter.
+          mvn -B -ntp dependency:analyze-only -DfailOnWarning=false
+          mvn -B -ntp enforcer:enforce -Drules=requireUpperBoundDeps || {
+            echo "Dependency convergence problem — resolve the conflicting versions in pom.xml"; exit 1; }
 
   - id: test
     kind: test
     needs: [detect-changes]
-    timeout_minutes: 15
+    timeout_minutes: 20
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-java@v4
         with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - name: Install (npm workspace root)
-        run: npm ci
-      - name: Test with coverage
-        run: npm run test:coverage
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Test
+        working-directory: app
+        run: mvn -B -ntp verify
+      - name: The HTTP contract the chart depends on was actually exercised
+        working-directory: app
+        run: |
+          set -euo pipefail
+          # Surefire exits 0 when it runs ZERO tests, which would silently turn
+          # this gate into a no-op. Assert real tests ran.
+          REPORTS="target/surefire-reports"
+          test -d "$REPORTS" || { echo "no surefire reports — tests did not run"; exit 1; }
+          RUN="$(grep -ho 'tests="[0-9]*"' "$REPORTS"/*.xml | grep -o '[0-9]*' | paste -sd+ - | bc)"
+          echo "tests executed: $RUN"
+          [ "${RUN:-0}" -ge 4 ] || { echo "expected at least 4 contract tests, got ${RUN:-0}"; exit 1; }
 
   - id: security
     kind: security
@@ -81,27 +97,6 @@ stages:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - name: The path-to-regexp override actually reached the lockfile
-        run: |
-          set -euo pipefail
-          npm ci
-          # express@4.x pins path-to-regexp to the 0.1.x line, which carries
-          # CVE-2024-52798 and CVE-2026-4867 (both HIGH ReDoS). The root
-          # package.json `overrides` block forces 0.1.13. Assert it here so a
-          # dependency bump that silently drops the override fails FAST and
-          # cheap, rather than at the image scan four minutes later.
-          RESOLVED="$(npm ls path-to-regexp --all --json \
-            | grep -o '"version": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
-          echo "path-to-regexp resolved to: $RESOLVED"
-          case "$RESOLVED" in
-            0.1.1[3-9]|0.1.[2-9][0-9]|[1-9]*) echo "Patched version in place." ;;
-            *) echo "GUARD FAILED: path-to-regexp is $RESOLVED — the override was lost"; exit 1 ;;
-          esac
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.3
@@ -162,11 +157,27 @@ stages:
             echo "GUARD FAILED: an Application points at app/ or .github/"; exit 1
           fi
           echo "No Application watches app/ or .github/."
+      - name: The chart's probe paths are endpoints the app actually serves
+        run: |
+          set -euo pipefail
+          # The Java service remaps Actuator to /healthz and /metrics so the
+          # chart, the ServiceScrapes and the verify stage did not change when
+          # the runtime did. If someone "tidies" application.properties back to
+          # the /actuator/** defaults, the probes start 404ing and every pod
+          # fails readiness. Catch that here, not in a rollout.
+          PROPS=app/src/main/resources/application.properties
+          grep -q 'path-mapping.health=healthz'      "$PROPS" || {
+            echo "GUARD FAILED: /healthz mapping missing — chart probes will 404"; exit 1; }
+          grep -q 'path-mapping.prometheus=metrics'  "$PROPS" || {
+            echo "GUARD FAILED: /metrics mapping missing — ServiceScrapes will 404"; exit 1; }
+          grep -q 'base-path=/'                      "$PROPS" || {
+            echo "GUARD FAILED: actuator base-path is not / — probe paths change"; exit 1; }
+          echo "Probe and scrape endpoints match the chart."
 
   - id: build-push
     kind: build_push
     needs: [lint, test, security]
-    timeout_minutes: 25
+    timeout_minutes: 30
     env:
       AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
       AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
@@ -196,9 +207,10 @@ stages:
                --image-ids imageTag="$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists in ECR — refusing to overwrite (trap 1)."; exit 1
           fi
-          # Context is the repo ROOT: app/ is an npm workspace and the lockfile
-          # that `npm ci` needs lives at the root, outside ./app.
-          docker build -f app/Dockerfile -t "$REPO:$TAG" .
+          # Context is ./app: the Maven project is self-contained there. (The
+          # previous Node app needed a repo-root context because npm workspaces
+          # put the lockfile outside app/ — that constraint is gone.)
+          docker build -f app/Dockerfile -t "$REPO:$TAG" app
       - name: Scan the image BEFORE it is pushed
         run: |
           set -euo pipefail
@@ -213,6 +225,12 @@ stages:
           # the official image removes the installer and the marketplace ref
           # entirely. The image is scanned from the local docker daemon (it has
           # not been pushed yet), which is why the socket is mounted.
+          #
+          # The runtime base is eclipse-temurin:21-jre-jammy with an
+          # `apt-get upgrade` in the Dockerfile, chosen because distroless-java
+          # ships the same unpatchable Debian 12 openssl that blocked the
+          # previous image. The gate below is UNCHANGED: HIGH/CRITICAL, fixed
+          # findings only, and it still runs before the push.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
@@ -383,9 +401,23 @@ stages:
           HOST="$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
             -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
           echo "ingress: $HOST"
+          # Spring Boot's first start behind a cold JVM is slower than the Node
+          # app was, hence the generous retry budget here.
           curl --fail --retry 20 --retry-delay 15 --retry-all-errors "http://${HOST}/healthz"
           curl --fail --retry 5 --retry-delay 10 --retry-all-errors "http://${HOST}/" -o /dev/null
           echo "Console: http://${HOST}/argocd   Dashboards: http://${HOST}/grafana"
+      - name: The live page reports the tag this run deployed
+        run: |
+          set -euo pipefail
+          HOST="$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          # End-to-end proof: the chart injected APP_VERSION, the Java service
+          # read it, and the response travelled back through the ingress.
+          BODY="$(curl --fail --retry 10 --retry-delay 10 --retry-all-errors \
+            -s "http://${HOST}/api/info")"
+          echo "$BODY"
+          echo "$BODY" | grep -q "${IMAGE_TAG}" || {
+            echo "MISMATCH: /api/info does not report ${IMAGE_TAG}"; exit 1; }
 
   - id: rollback
     kind: custom
