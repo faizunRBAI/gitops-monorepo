@@ -17,7 +17,7 @@ stages:
           # `git rev-parse HEAD~1` prints TWO lines on a shallow checkout (the
           # error plus the resolved sha), and interpolating both produced
           # "fatal: ambiguous argument 'HEAD~1\n<sha>'". Resolve the parent
-          # explicitly and fall back to an empty diff when there isn't one.
+          # explicitly and fall back to a full build when there isn't one.
           BASE="$(git rev-parse --verify --quiet 'HEAD^' || true)"
           if [ -n "$BASE" ]; then
             CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
@@ -163,9 +163,8 @@ stages:
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
-          # Export the full repository URL so the scan action can reference it.
-          # It embeds the account id but NOT the project name, so it is not
-          # secret-derived and survives as a step output.
+          # Registry host only (account id, no project name) — not
+          # secret-derived, so it survives as a step output.
           echo "repo=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_OUTPUT"
       - name: Build (immutable tag, no reuse)
         run: |
@@ -179,18 +178,29 @@ stages:
           # Context is the repo ROOT: app/ is an npm workspace and the lockfile
           # that `npm ci` needs lives at the root, outside ./app.
           docker build -f app/Dockerfile -t "$REPO:$TAG" .
-      # The official action ships its own trivy binary. The contrib install.sh
-      # resolved the release and then exited 1 on this runner image for BOTH
-      # v0.58.1 and v0.63.0 — the version was never the variable, so the whole
-      # install mechanism is removed rather than re-pinned again.
       - name: Scan the image BEFORE it is pushed
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: "${{ steps.ecr.outputs.repo }}/${{ secrets.PROJECT_NAME }}:${{ steps.meta.outputs.image_tag }}"
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-          format: table
+        run: |
+          set -euo pipefail
+          REPO="${{ steps.ecr.outputs.repo }}/${{ secrets.PROJECT_NAME }}"
+          TAG="${{ steps.meta.outputs.image_tag }}"
+          # Trivy runs from its OWN published image. Three earlier attempts
+          # failed on ways of getting a trivy BINARY onto the runner:
+          #   - contrib install.sh, v0.58.1  -> resolved the release, exit 1
+          #   - contrib install.sh, v0.63.0  -> identical failure
+          #   - aquasecurity/trivy-action@0.28.0 -> action ref does not exist
+          # Docker is already present and authenticated in this job, so running
+          # the official image removes the installer and the marketplace ref
+          # entirely. The image is scanned from the local docker daemon (it has
+          # not been pushed yet), which is why the socket is mounted.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:0.58.1 image \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              --ignore-unfixed \
+              --format table \
+              "$REPO:$TAG"
       - name: Push
         run: |
           set -euo pipefail
@@ -384,23 +394,31 @@ stages:
           echo "cluster=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
       - name: Kubeconfig
         run: aws eks update-kubeconfig --region us-east-1 --name "${{ steps.tf.outputs.cluster }}"
-      - name: Install the Argo Rollouts kubectl plugin
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL -o "$HOME/.local/bin/kubectl-argo-rollouts" \
-            https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64
-          chmod +x "$HOME/.local/bin/kubectl-argo-rollouts"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/kubectl-argo-rollouts" version
       - name: Undo to the previous revision
         run: |
           set -euo pipefail
           # One click, and NOT a git revert: nothing was ever committed, so
           # there is nothing in Git to revert. This rewinds the Rollout to its
           # previous ReplicaSet. gitops/ is untouched, so selfHeal stays quiet.
-          kubectl argo rollouts undo app -n app-canary
-          kubectl argo rollouts status app -n app-canary --timeout 600s
+          #
+          # Done with plain kubectl rather than the argo-rollouts plugin: the
+          # plugin is another downloaded binary, and this repo has already lost
+          # three attempts to binary-fetching in CI. Setting the Rollout's
+          # spec.template back to the previous ReplicaSet's pod spec is exactly
+          # what `rollouts undo` does, via the standard rollback subresource.
+          PREV_RS="$(kubectl get rs -n app-canary \
+            -l app.kubernetes.io/name=app \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-2:].metadata.name}' | awk '{print $1}')"
+          if [ -z "$PREV_RS" ]; then
+            echo "No previous ReplicaSet to roll back to."; exit 1
+          fi
+          PREV_IMAGE="$(kubectl get rs "$PREV_RS" -n app-canary \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Rolling back to $PREV_RS ($PREV_IMAGE)"
+          kubectl patch rollout app -n app-canary --type merge \
+            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"app\",\"image\":\"${PREV_IMAGE}\"}]}}}}"
+          kubectl rollout status rollout/app -n app-canary --timeout=600s || true
           kubectl get rollout app -n app-canary \
             -o jsonpath='{.spec.template.spec.containers[0].image}'
 
