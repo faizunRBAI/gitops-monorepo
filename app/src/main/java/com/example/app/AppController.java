@@ -1,5 +1,6 @@
 package com.example.app;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -79,11 +80,18 @@ public class AppController {
                 .formatted(buildInfo.version(), buildInfo.releaseMode(), buildInfo.podName());
     }
 
+    /**
+     * A LinkedHashMap, not Map.of(): Map.of() has a randomized iteration order,
+     * so the serialized key order would differ between JVM runs. The verify
+     * stage greps this response for the deployed tag, and anyone diffing it
+     * across deploys deserves a stable shape.
+     */
     @GetMapping(value = "/api/info", produces = MediaType.APPLICATION_JSON_VALUE)
     public Map<String, String> info() {
-        return Map.of(
-                "version", buildInfo.version(),
-                "mode", buildInfo.releaseMode(),
-                "pod", buildInfo.podName());
+        Map<String, String> body = new LinkedHashMap<>();
+        body.put("version", buildInfo.version());
+        body.put("mode", buildInfo.releaseMode());
+        body.put("pod", buildInfo.podName());
+        return body;
     }
 }
