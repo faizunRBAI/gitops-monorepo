@@ -45,9 +45,17 @@ stages:
           distribution: temurin
           java-version: "21"
           cache: maven
-      - name: Compile (javac IS the typecheck)
+      - name: Compile main AND test sources (javac IS the typecheck)
         working-directory: app
-        run: mvn -B -ntp clean compile
+        run: |
+          set -euo pipefail
+          # test-compile, not compile: `compile` builds src/main only, so a bad
+          # import in a test surfaced later, in the `test` stage, after a full
+          # mvn verify. A test that references a relocated class (Micrometer
+          # 1.13 moved PrometheusMeterRegistry out of io.micrometer.prometheus)
+          # is a compile error, and it should cost seconds here rather than a
+          # deploy attempt there.
+          mvn -B -ntp clean test-compile
       - name: Enforce a reproducible dependency tree
         working-directory: app
         run: |
@@ -172,6 +180,15 @@ stages:
             echo "GUARD FAILED: /metrics mapping missing — ServiceScrapes will 404"; exit 1; }
           grep -q 'base-path=/'                      "$PROPS" || {
             echo "GUARD FAILED: actuator base-path is not / — probe paths change"; exit 1; }
+          # EXPOSURE IS NOT ENABLEMENT. exposure.include makes a registered
+          # endpoint visible; management.endpoint.<id>.enabled decides whether
+          # it is created at all. /metrics 404'd for two CI attempts with
+          # 'prometheus' correctly listed in exposure.include, so both halves
+          # are asserted here.
+          grep -q 'exposure.include=.*prometheus'    "$PROPS" || {
+            echo "GUARD FAILED: prometheus not in exposure.include — /metrics will 404"; exit 1; }
+          grep -q 'endpoint.prometheus.enabled=true' "$PROPS" || {
+            echo "GUARD FAILED: prometheus endpoint not enabled — exposure alone does not create it"; exit 1; }
           echo "Probe and scrape endpoints match the chart."
 
   - id: build-push
@@ -406,6 +423,20 @@ stages:
           curl --fail --retry 20 --retry-delay 15 --retry-all-errors "http://${HOST}/healthz"
           curl --fail --retry 5 --retry-delay 10 --retry-all-errors "http://${HOST}/" -o /dev/null
           echo "Console: http://${HOST}/argocd   Dashboards: http://${HOST}/grafana"
+      - name: The scrape endpoint the ServiceScrapes poll actually serves metrics
+        run: |
+          set -euo pipefail
+          HOST="$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          # Trap 2 end-to-end: gitops/scrapes/app-scrapes.yaml polls /metrics.
+          # A 404 there leaves the observability Application Healthy while it
+          # silently collects nothing, which is the exact failure the spec's
+          # trap 2 exists to prevent.
+          BODY="$(curl --fail --retry 10 --retry-delay 10 --retry-all-errors \
+            -s "http://${HOST}/metrics")"
+          echo "$BODY" | head -20
+          echo "$BODY" | grep -q 'jvm_memory_used_bytes' || {
+            echo "MISMATCH: /metrics is not serving Prometheus text"; exit 1; }
       - name: The live page reports the tag this run deployed
         run: |
           set -euo pipefail
