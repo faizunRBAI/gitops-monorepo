@@ -1,0 +1,30 @@
+# ServiceMonitors for every workload, including ArgoCD's own controller
+# (trap 2 — the chart ships the controller without a scrapeable Service).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: scrapes
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: gitops/scrapes
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

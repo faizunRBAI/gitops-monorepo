@@ -1,0 +1,19 @@
+# The build context is the repository root (see app/Dockerfile), so everything
+# that is not needed to build the app image is excluded here.
+.git
+.github
+.udap
+infra
+gitops
+chart
+flux
+node_modules
+app/node_modules
+app/dist
+app/coverage
+app/test
+**/*.md
+.gitignore
+.env
+.env.*
+npm-debug.log*

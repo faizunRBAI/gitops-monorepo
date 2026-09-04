@@ -1,0 +1,30 @@
+{{/*
+TRAP 5 — THE GUARD.
+
+This Deployment renders ONLY when neither Rollout mode is on. If it rendered
+alongside a canary Rollout, both controllers would manage the same selector and
+the canary would never converge.
+
+The security stage in .udap/pipeline.yaml renders all three modes and FAILS the
+build if a Deployment appears in either Rollout mode, so a regression here is
+caught before it reaches a cluster.
+*/}}
+{{- if eq (include "app.rolloutEnabled" .) "false" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "app.labels" . | nindent 8 }}
+    spec:
+      {{- include "app.podSpec" . | nindent 6 }}
+{{- end }}

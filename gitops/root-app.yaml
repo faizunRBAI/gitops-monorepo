@@ -1,0 +1,55 @@
+# =============================================================================
+# THE ROOT APP-OF-APPS (user spec §2.3) — DOCUMENTATION COPY. NOT APPLIED.
+#
+# ArgoCD does not read this file, and neither does terraform. The root
+# Application is the one object that cannot be reconciled from Git, because it
+# is what teaches ArgoCD where Git is.
+#
+# It is defined ONCE, inline, in infra/bootstrap.tf (resource
+# "kubectl_manifest" "root_app") — built with yamlencode because it needs the
+# ECR repository URL, which does not exist until apply time. One definition
+# means there is no copy to drift.
+#
+# This file exists so the bootstrap object is reviewable alongside the rest of
+# the GitOps config. If you change the resource in bootstrap.tf, update the
+# body below to match.
+#
+# WHY gitops/apps/ IS A HELM CHART RATHER THAN PLAIN YAML
+# -------------------------------------------------------
+# Two facts are not knowable until the cluster exists: this repository's URL
+# and the ECR repository URL (which embeds the AWS account id). Every child
+# Application needs both. Having the pipeline patch them in later would write
+# into gitops/ — the one tree selfHeal owns — and break spec §4 rule 4.
+# Passing them as Helm parameters on the root Application instead keeps the
+# pipeline out of gitops/ entirely.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: <terraform: var.repo_url>
+    targetRevision: <terraform: var.branch>
+    path: gitops/apps          # <-- watches ONLY this folder
+    helm:
+      parameters:
+        - name: repoURL
+          value: <terraform: var.repo_url>
+        - name: imageRepository
+          value: <terraform: aws_ecr_repository.app.repository_url>
+        - name: targetRevision
+          value: <terraform: var.branch>
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true           # safe: the pipeline never writes to gitops/
+    syncOptions:
+      - CreateNamespace=true

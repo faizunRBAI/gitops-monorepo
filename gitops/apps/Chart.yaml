@@ -1,0 +1,9 @@
+# The app-of-apps chart. Contains ONLY ArgoCD Application objects — no
+# workloads. The root Application renders this with two parameters supplied by
+# terraform at bootstrap (repoURL, imageRepository), which is how the child
+# Applications learn values that are not knowable until the cluster exists.
+apiVersion: v2
+name: apps
+description: ArgoCD app-of-apps — one Application per platform component.
+type: application
+version: 1.0.0

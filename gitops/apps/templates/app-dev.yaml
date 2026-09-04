@@ -1,0 +1,35 @@
+# Dev environment — plain Deployment (both mode switches off), MANUAL sync.
+#
+# Spec §3.3: "auto_sync_after_deploy: false can leave dev manual-sync."
+# No syncPolicy.automated block, so dev only moves when someone syncs it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: chart/app
+    helm:
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: image.repository
+          value: {{ .Values.imageRepository | quote }}
+        - name: canary.enabled
+          value: "false"
+        - name: blueGreen.enabled
+          value: "false"
+        - name: replicaCount
+          value: "1"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-dev
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

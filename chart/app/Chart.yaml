@@ -1,0 +1,6 @@
+apiVersion: v2
+name: app
+description: The application chart. Renders a plain Deployment, a blue/green Rollout, or a canary Rollout from mutually exclusive mode switches.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

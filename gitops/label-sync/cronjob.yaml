@@ -1,0 +1,109 @@
+# =============================================================================
+# TRAP 3 (user spec §6.3): "the stale console label (the label-sync CronJob)"
+# TRAP 4: "distroless images having no shell (use a shell+kubectl image)"
+#
+# Because the pipeline sets the image tag as a live Helm PARAMETER rather than
+# committing it, the ArgoCD console's own metadata can lag behind what is
+# actually running. This CronJob reads status.summary.images off each
+# Application every minute and writes the real running tag back as a label, so
+# the console never shows a version that isn't deployed.
+#
+# The image MUST have a shell and kubectl. bitnami/kubectl qualifies;
+# a distroless image does not — `sh -c` would fail with "no such file".
+# The APPLICATION image stays distroless. This is the one place we opt out.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: label-sync
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: label-sync
+  namespace: argocd
+rules:
+  # Scoped to Applications in this namespace only — no cluster-wide grant.
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: label-sync
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: label-sync
+subjects:
+  - kind: ServiceAccount
+    name: label-sync
+    namespace: argocd
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: label-sync
+  namespace: argocd
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 30
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 120
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: label-sync
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: sync
+              # Shell + kubectl. Pinned, never :latest.
+              image: bitnami/kubectl:1.31.3
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 64Mi
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  for APP in app-dev app-bluegreen app-canary; do
+                    IMG="$(kubectl get application "$APP" -n argocd \
+                      -o jsonpath='{.status.summary.images[0]}' 2>/dev/null || true)"
+                    if [ -z "$IMG" ]; then
+                      echo "$APP: no image reported yet, skipping"
+                      continue
+                    fi
+                    # Label values may not contain '/' or ':' — keep the tag only.
+                    TAG="${IMG##*:}"
+                    CUR="$(kubectl get application "$APP" -n argocd \
+                      -o jsonpath='{.metadata.labels.running-image-tag}' 2>/dev/null || true)"
+                    if [ "$TAG" = "$CUR" ]; then
+                      echo "$APP: label already $TAG"
+                      continue
+                    fi
+                    echo "$APP: $CUR -> $TAG"
+                    kubectl label application "$APP" -n argocd \
+                      "running-image-tag=$TAG" --overwrite
+                  done

@@ -1,0 +1,396 @@
+version: 1
+name: gitops-monorepo
+vcs: github
+
+stages:
+  - id: detect-changes
+    kind: custom
+    timeout_minutes: 5
+    outputs:
+      app_changed: "${{ steps.filter.outputs.app_changed }}"
+      chart_changed: "${{ steps.filter.outputs.chart_changed }}"
+    steps:
+      - name: Classify changed paths (monorepo path discipline)
+        id: filter
+        run: |
+          set -euo pipefail
+          BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+          echo "changed files:"; echo "$CHANGED"
+          app=false; chart=false
+          echo "$CHANGED" | grep -qE '^app/'   && app=true   || true
+          echo "$CHANGED" | grep -qE '^chart/' && chart=true || true
+          if echo "$CHANGED" | grep -qE '^(gitops|flux)/' && [ "$app" = false ] && [ "$chart" = false ]; then
+            echo "GitOps-only change: ArgoCD applies this, CI does not build it."
+          fi
+          echo "app_changed=$app" >> "$GITHUB_OUTPUT"
+          echo "chart_changed=$chart" >> "$GITHUB_OUTPUT"
+
+  - id: lint
+    kind: lint
+    needs: [detect-changes]
+    timeout_minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install (npm workspace root)
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run build --workspace app
+
+  - id: test
+    kind: test
+    needs: [detect-changes]
+    timeout_minutes: 15
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install (npm workspace root)
+        run: npm ci
+      - name: Test with coverage
+        run: npm run test:coverage
+
+  - id: security
+    kind: security
+    needs: [detect-changes]
+    timeout_minutes: 15
+    env:
+      # Dummy value: the render checks only care about STRUCTURE, and the chart
+      # helper fails fast when image.repository is empty. The real value is
+      # supplied by the ArgoCD Application at sync time.
+      RENDER_REPO: "000000000000.dkr.ecr.us-east-1.amazonaws.com/app"
+    steps:
+      - name: Gitleaks (secret scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+      # The official action rather than `curl | bash`: version-pinned, cached,
+      # and it does not need sudo to write into /usr/local/bin.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Lint both charts
+        run: |
+          set -euo pipefail
+          helm lint chart/app --set image.repository="$RENDER_REPO"
+          helm lint gitops/apps
+      - name: Render all three modes (plain-Deployment guard must exclude canary)
+        run: |
+          set -euo pipefail
+          helm template chart/app --set image.repository="$RENDER_REPO" \
+            --set canary.enabled=true  --set blueGreen.enabled=false > /tmp/canary.yaml
+          helm template chart/app --set image.repository="$RENDER_REPO" \
+            --set canary.enabled=false --set blueGreen.enabled=true  > /tmp/bg.yaml
+          helm template chart/app --set image.repository="$RENDER_REPO" \
+            --set canary.enabled=false --set blueGreen.enabled=false > /tmp/plain.yaml
+
+          grep -q 'kind: Rollout'    /tmp/canary.yaml || { echo "canary did not render a Rollout"; exit 1; }
+          grep -q 'kind: Rollout'    /tmp/bg.yaml     || { echo "bluegreen did not render a Rollout"; exit 1; }
+          grep -q 'kind: Deployment' /tmp/plain.yaml  || { echo "plain did not render a Deployment"; exit 1; }
+
+          if grep -q 'kind: Deployment' /tmp/canary.yaml; then
+            echo "GUARD FAILED: plain Deployment rendered alongside canary Rollout"; exit 1
+          fi
+          if grep -q 'kind: Deployment' /tmp/bg.yaml; then
+            echo "GUARD FAILED: plain Deployment rendered alongside bluegreen Rollout"; exit 1
+          fi
+          echo "Plain-Deployment guard holds in all three modes."
+      - name: Both modes at once must be rejected, not silently rendered
+        run: |
+          set -euo pipefail
+          if helm template chart/app --set image.repository="$RENDER_REPO" \
+               --set canary.enabled=true --set blueGreen.enabled=true > /dev/null 2>&1; then
+            echo "GUARD FAILED: canary + blueGreen together should abort the render"; exit 1
+          fi
+          echo "Mutual exclusion enforced."
+      - name: App-of-apps renders, and commits no image tag
+        run: |
+          set -euo pipefail
+          helm template gitops/apps > /tmp/apps.yaml
+          for A in observability scrapes dashboards label-sync app-dev app-bluegreen app-canary; do
+            grep -q "name: $A" /tmp/apps.yaml || { echo "missing Application: $A"; exit 1; }
+          done
+          # Spec §4 rule 2: a committed image.tag parameter would be reverted by
+          # selfHeal on the next reconcile, silently undoing every deploy.
+          if grep -q 'name: image.tag' /tmp/apps.yaml; then
+            echo "GUARD FAILED: image.tag is committed in gitops/apps — selfHeal will fight the pipeline"; exit 1
+          fi
+          echo "No committed image.tag. Deploys stay out of Git."
+      - name: ArgoCD watches only gitops/ (spec §4 rule 1)
+        run: |
+          set -euo pipefail
+          helm template gitops/apps > /tmp/apps.yaml
+          # chart/app is legitimately referenced (Argo READS the chart), but a
+          # path under app/ or .github/ would mean Argo owns pipeline inputs.
+          if grep -E '^\s+path: (app|\.github)(/|$)' /tmp/apps.yaml; then
+            echo "GUARD FAILED: an Application points at app/ or .github/"; exit 1
+          fi
+          echo "No Application watches app/ or .github/."
+
+  - id: build-push
+    kind: build_push
+    needs: [lint, test, security]
+    timeout_minutes: 25
+    env:
+      AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+      AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      AWS_REGION: us-east-1
+    outputs:
+      image_tag: "${{ steps.meta.outputs.image_tag }}"
+    steps:
+      - name: Compute immutable tag
+        id: meta
+        run: echo "image_tag=git-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Login to ECR
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
+      - name: Build (immutable tag, no reuse)
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.PROJECT_NAME }}"
+          TAG="${{ steps.meta.outputs.image_tag }}"
+          if aws ecr describe-images --repository-name "${{ secrets.PROJECT_NAME }}" \
+               --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists in ECR — refusing to overwrite (trap 1)."; exit 1
+          fi
+          # Context is the repo ROOT: app/ is an npm workspace and the lockfile
+          # that `npm ci` needs lives at the root, outside ./app.
+          docker build -f app/Dockerfile -t "$REPO:$TAG" .
+      - name: Scan the image BEFORE it is pushed
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.PROJECT_NAME }}"
+          # Install into $HOME: the runner's /usr/local/bin needs sudo.
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/.local/bin" v0.58.1
+          "$HOME/.local/bin/trivy" image --severity HIGH,CRITICAL --exit-code 1 \
+            --ignore-unfixed "$REPO:${{ steps.meta.outputs.image_tag }}"
+      - name: Push
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.PROJECT_NAME }}"
+          docker push "$REPO:${{ steps.meta.outputs.image_tag }}"
+
+  - id: provision
+    kind: provision
+    needs: [build-push]
+    timeout_minutes: 60
+    env:
+      AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+      AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: "${{ secrets.PROJECT_NAME }}"
+      TF_VAR_region: us-east-1
+      TF_VAR_repo_url: "${{ secrets.GITOPS_REPO_URL }}"
+      TF_VAR_branch: main
+    steps:
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve
+
+  - id: configure
+    kind: configure
+    needs: [provision, build-push]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+      AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      AWS_REGION: us-east-1
+      IMAGE_TAG: "${{ needs.build-push.outputs.image_tag }}"
+    steps:
+      - uses: azure/setup-kubectl@v3
+        with:
+          version: v1.33.0
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Read cluster name from state (self-sufficient job rule)
+        id: tf
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          echo "cluster=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+      - name: Kubeconfig
+        run: aws eks update-kubeconfig --region us-east-1 --name "${{ steps.tf.outputs.cluster }}"
+      - name: Wait for the root app-of-apps to materialise its children
+        run: |
+          set -euo pipefail
+          kubectl wait --for=jsonpath='{.status.health.status}'=Healthy \
+            application/root -n argocd --timeout=600s
+          kubectl wait --for=create application/app-canary -n argocd --timeout=300s
+      - name: Capture the previous tag (the rollback target)
+        id: prev
+        run: |
+          set -euo pipefail
+          PREV="$(kubectl get application app-canary -n argocd \
+            -o jsonpath='{.spec.source.helm.parameters[?(@.name=="image.tag")].value}' 2>/dev/null || true)"
+          echo "previous_tag=${PREV:-none}" >> "$GITHUB_OUTPUT"
+          echo "Previous image tag: ${PREV:-none} (none = first deploy)"
+      - name: Patch the Application Helm parameter (deploy = cluster state, NOT a git commit)
+        run: |
+          set -euo pipefail
+          # JSON-patch, not merge-patch: a merge on spec.source.helm would
+          # replace the whole parameters array and drop image.repository and
+          # the mode switches that Git owns.
+          PARAMS="$(kubectl get application app-canary -n argocd \
+            -o jsonpath='{range .spec.source.helm.parameters[*]}{.name}{"\n"}{end}')"
+          IDX="$(echo "$PARAMS" | grep -n '^image.tag$' | cut -d: -f1 || true)"
+          if [ -n "$IDX" ]; then
+            kubectl patch application app-canary -n argocd --type json \
+              -p "[{\"op\":\"replace\",\"path\":\"/spec/source/helm/parameters/$((IDX-1))/value\",\"value\":\"${IMAGE_TAG}\"}]"
+          else
+            kubectl patch application app-canary -n argocd --type json \
+              -p "[{\"op\":\"add\",\"path\":\"/spec/source/helm/parameters/-\",\"value\":{\"name\":\"image.tag\",\"value\":\"${IMAGE_TAG}\"}}]"
+          fi
+          echo "app-canary image.tag -> ${IMAGE_TAG}"
+      - name: Hard refresh so ArgoCD re-renders immediately
+        run: |
+          kubectl -n argocd annotate application app-canary \
+            argocd.argoproj.io/refresh=hard --overwrite
+
+  - id: verify
+    kind: verify
+    needs: [provision, configure, build-push]
+    timeout_minutes: 40
+    env:
+      AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+      AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      AWS_REGION: us-east-1
+      IMAGE_TAG: "${{ needs.build-push.outputs.image_tag }}"
+    steps:
+      - uses: azure/setup-kubectl@v3
+        with:
+          version: v1.33.0
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Read cluster name from state
+        id: tf
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          echo "cluster=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+      - name: Kubeconfig
+        run: aws eks update-kubeconfig --region us-east-1 --name "${{ steps.tf.outputs.cluster }}"
+      - name: App Synced + Healthy
+        run: |
+          set -euo pipefail
+          kubectl wait --for=jsonpath='{.status.sync.status}'=Synced \
+            application/app-canary -n argocd --timeout=900s
+          kubectl wait --for=jsonpath='{.status.health.status}'=Healthy \
+            application/app-canary -n argocd --timeout=900s
+      - name: The running image is the one this run built
+        run: |
+          set -euo pipefail
+          RUNNING="$(kubectl get rollout app -n app-canary \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "running: $RUNNING"
+          echo "$RUNNING" | grep -q ":${IMAGE_TAG}$" || {
+            echo "MISMATCH: expected tag ${IMAGE_TAG}"; exit 1; }
+      - name: Observability reconciled, and ArgoCD itself is scrapeable (trap 2)
+        run: |
+          set -euo pipefail
+          kubectl wait --for=jsonpath='{.status.health.status}'=Healthy \
+            application/observability -n argocd --timeout=1200s
+          kubectl get svc argocd-application-controller-metrics -n argocd
+          kubectl get servicemonitor argocd-application-controller -n monitoring
+      - name: selfHeal did not revert the deploy (spec §4 rule 4)
+        run: |
+          set -euo pipefail
+          sleep 60
+          kubectl get application app-canary -n argocd \
+            -o jsonpath='{.status.sync.status}' | grep -q Synced || {
+            echo "app-canary drifted after the patch — selfHeal is fighting the pipeline"; exit 1; }
+          echo "Still Synced a minute after the patch. No loop."
+      - name: App answers through the ingress
+        run: |
+          set -euo pipefail
+          HOST="$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          echo "ingress: $HOST"
+          curl --fail --retry 20 --retry-delay 15 --retry-all-errors "http://${HOST}/healthz"
+          curl --fail --retry 5 --retry-delay 10 --retry-all-errors "http://${HOST}/" -o /dev/null
+          echo "Console: http://${HOST}/argocd   Dashboards: http://${HOST}/grafana"
+
+  - id: rollback
+    kind: custom
+    needs: [verify]
+    approval: true
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+      AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      AWS_REGION: us-east-1
+    steps:
+      - uses: azure/setup-kubectl@v3
+        with:
+          version: v1.33.0
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Read cluster name from state
+        id: tf
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          echo "cluster=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+      - name: Kubeconfig
+        run: aws eks update-kubeconfig --region us-east-1 --name "${{ steps.tf.outputs.cluster }}"
+      - name: Install the Argo Rollouts kubectl plugin
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL -o "$HOME/.local/bin/kubectl-argo-rollouts" \
+            https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64
+          chmod +x "$HOME/.local/bin/kubectl-argo-rollouts"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Undo to the previous revision
+        run: |
+          set -euo pipefail
+          # One click, and NOT a git revert: nothing was ever committed, so
+          # there is nothing in Git to revert. This rewinds the Rollout to its
+          # previous ReplicaSet. gitops/ is untouched, so selfHeal stays quiet.
+          kubectl argo rollouts undo app -n app-canary
+          kubectl argo rollouts status app -n app-canary --timeout 600s
+          kubectl get rollout app -n app-canary \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+rollback:
+  strategy: manual

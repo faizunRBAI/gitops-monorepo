@@ -1,0 +1,42 @@
+# kube-prometheus-stack — "watched on a dashboard".
+#
+# Multi-source Application (user spec §2.4): the chart comes from the upstream
+# Helm repo, the values come from THIS repo via the $values reference. That
+# keeps us on the maintained upstream chart while our tuning stays in Git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observability
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: {{ .Values.observability.chartVersion | quote }}
+      helm:
+        valueFiles:
+          - $values/gitops/observability/values.yaml
+    - repoURL: {{ .Values.repoURL | quote }}
+      targetRevision: {{ .Values.targetRevision | quote }}
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # This chart's CRDs exceed the 262144-byte annotation limit that
+      # client-side apply uses for last-applied-configuration.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

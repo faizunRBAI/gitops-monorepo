@@ -1,0 +1,47 @@
+# =============================================================================
+# TRAP 2 (user spec §6.3): "ArgoCD's missing controller-metrics Service (add one)"
+#
+# The argo-cd chart runs the application-controller with metrics on :8082 but
+# does not create a Service in front of it, so there is nothing for Prometheus
+# to discover. Without this, ArgoCD is the one component in the platform you
+# cannot see on the dashboard — which is exactly the component whose health
+# tells you whether GitOps is working at all.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-application-controller-metrics
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-application-controller
+    app.kubernetes.io/part-of: argocd
+spec:
+  type: ClusterIP
+  # Headless: this Service exists purely as a scrape target, never for routing.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: argocd-application-controller
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 8082
+      targetPort: 8082
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: argocd-application-controller
+  namespace: monitoring
+  labels:
+    release: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - argocd
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-application-controller
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics

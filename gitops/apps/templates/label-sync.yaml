@@ -1,0 +1,23 @@
+# The every-minute CronJob that keeps the ArgoCD console's image label accurate
+# (trap 3). Its image has a shell + kubectl — deliberately NOT distroless
+# (trap 4). The app image itself stays distroless.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: label-sync
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: gitops/label-sync
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

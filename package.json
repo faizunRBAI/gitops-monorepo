@@ -1,0 +1,19 @@
+{
+  "name": "gitops-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitOps monorepo: application, Helm chart, cluster config and pipeline in one repository.",
+  "//": "npm workspace root. ONE lockfile lives here and covers app/. The Docker build context is therefore the repo ROOT (not ./app) so the image build can see it — see app/Dockerfile and the build-push stage.",
+  "workspaces": [
+    "app"
+  ],
+  "scripts": {
+    "lint": "npm run lint --workspace app",
+    "test": "npm run test --workspace app",
+    "test:coverage": "npm run test:coverage --workspace app",
+    "build": "npm run build --workspace app"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

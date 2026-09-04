@@ -1,0 +1,58 @@
+# Canary environment — gradual releases via Argo Rollouts.
+#
+# THIS IS WHERE SPEC §4 RULE 2 LIVES.
+#
+# The pipeline sets image.tag by PATCHING spec.source.helm.parameters on this
+# LIVE object. image.tag is therefore deliberately ABSENT from the parameters
+# below: if it were committed here, selfHeal would revert the pipeline's patch
+# on the next reconcile and the deploy would silently roll back.
+#
+# ignoreDifferences on the parameters array is what makes the patch survive:
+# without it, Argo sees the live object carrying a parameter that Git does not
+# have, calls the app OutOfSync, and selfHeal removes it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-canary
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: chart/app
+    helm:
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: image.repository
+          value: {{ .Values.imageRepository | quote }}
+        - name: canary.enabled
+          value: "true"
+        - name: blueGreen.enabled
+          value: "false"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-canary
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 20s
+        factor: 2
+        maxDuration: 5m
+  ignoreDifferences:
+    # A canary mid-rollout legitimately has replica counts that differ from the
+    # spec. Without this, Argo flaps OutOfSync at every pause step.
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas

@@ -1,0 +1,63 @@
+replicaCount: 2
+
+image:
+  repository: ""            # set per-environment; empty renders a clear error
+  # PLACEHOLDER ONLY.
+  #
+  # The pipeline NEVER commits a real tag here (user spec §4 rule 2). It sets
+  # image.tag by patching the ArgoCD Application's spec.source.helm.parameters
+  # on the live object. That is what keeps deploys out of Git and lets
+  # selfHeal stay on without fighting the pipeline.
+  tag: "placeholder"
+  # Trap 1's second guard: even if a tag were somehow reused, the kubelet
+  # re-pulls rather than serving a cached layer.
+  pullPolicy: Always
+
+# ---- release mode (mutually exclusive; both false = plain Deployment) ----
+canary:
+  enabled: false
+  steps:
+    - setWeight: 20
+    - pause: { duration: 60s }
+    - setWeight: 50
+    - pause: { duration: 120s }
+    - setWeight: 80
+    - pause: { duration: 60s }
+
+blueGreen:
+  enabled: false
+  autoPromotionEnabled: false
+  scaleDownDelaySeconds: 30
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  path: /
+  pathType: Prefix
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 192Mi
+
+env:
+  releaseMode: ""           # defaulted by the templates from the mode switches
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

@@ -1,0 +1,39 @@
+# udap:meta cloud=aws region=us-east-1 target=eks
+
+dev: Developer { shape: person; udap-type: generic.user }
+ops: Operator { shape: person; udap-type: generic.user }
+gh: GitHub Monorepo (app/ chart/ gitops/) { shape: cylinder; udap-type: generic.app }
+ci: CI Pipeline (GitHub Actions) { udap-type: generic.app }
+ecr: ECR (scan-on-push) { udap-type: aws.ecr }
+vpc: VPC 2 AZs us-east-1 {
+  nlb: NLB { udap-type: aws.alb }
+  ingress: ingress-nginx { udap-type: generic.app }
+  eks: EKS 1.33 Node Group { udap-type: aws.eks }
+  argocd: ArgoCD + Application objects { udap-type: generic.app }
+  rollouts: Argo Rollouts { udap-type: generic.app }
+  app: App (canary / bluegreen / plain) { udap-type: generic.app }
+  prom: Prometheus { udap-type: generic.app }
+  graf: Grafana { udap-type: generic.app }
+  labelsync: label-sync CronJob { udap-type: generic.app }
+}
+
+dev -> gh: push
+gh -> ci: trigger on app/ chart/ .github/ ONLY
+ci -> ecr: build + push git-SHA tag
+ci -> vpc.argocd: patch Helm param (not a git commit)
+gh -> vpc.argocd: watches gitops/ only
+vpc.argocd -> vpc.app: sync from chart/
+vpc.argocd -> vpc.prom: sync observability
+vpc.argocd -> vpc.labelsync: sync label-sync
+vpc.rollouts -> vpc.app: canary steps
+vpc.app -> ecr: pull image
+vpc.prom -> vpc.argocd: scrape controller metrics
+vpc.prom -> vpc.app: scrape app metrics
+vpc.prom -> vpc.graf: datasource
+vpc.labelsync -> vpc.argocd: patch image label
+vpc.eks -> vpc.app: hosts
+ops -> vpc.nlb: console + dashboards
+vpc.nlb -> vpc.ingress: TLS
+vpc.ingress -> vpc.app: route
+vpc.ingress -> vpc.graf: route
+vpc.ingress -> vpc.argocd: route

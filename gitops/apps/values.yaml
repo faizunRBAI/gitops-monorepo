@@ -1,0 +1,17 @@
+# Both values are overridden by the root Application's Helm parameters, which
+# terraform sets at bootstrap. The defaults exist so `helm template` and
+# `helm lint` work in CI without cluster access.
+
+# HTTPS URL of this monorepo. Every child Application's repoURL.
+repoURL: "https://github.com/example/gitops-monorepo.git"
+
+# ECR repository URL — embeds the AWS account id, so it is only known after
+# terraform has run. The image TAG is deliberately not here: the pipeline
+# patches that onto the app Applications directly (spec §4 rule 2).
+imageRepository: "000000000000.dkr.ecr.us-east-1.amazonaws.com/gitops-monorepo"
+
+targetRevision: main
+
+# Pinned upstream chart version for kube-prometheus-stack.
+observability:
+  chartVersion: "65.5.1"

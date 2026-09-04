@@ -1,0 +1,40 @@
+# Blue/green environment. Same chart, different mode switches.
+# Same rule as app-canary: image.tag is patched onto the live object, not committed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-bluegreen
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL | quote }}
+    targetRevision: {{ .Values.targetRevision | quote }}
+    path: chart/app
+    helm:
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: image.repository
+          value: {{ .Values.imageRepository | quote }}
+        - name: canary.enabled
+          value: "false"
+        - name: blueGreen.enabled
+          value: "true"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app-bluegreen
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - RespectIgnoreDifferences=true
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/replicas

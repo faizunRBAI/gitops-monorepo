@@ -1,0 +1,101 @@
+# =============================================================================
+# App scrapes, one per environment (user spec §2.4).
+#
+# The relabel is the important part: the pod-template hash is what distinguishes
+# one rolled-out version from another, and Rollouts and Deployments name that
+# label DIFFERENTLY. Mapping both into a single `version` label is what lets one
+# dashboard panel compare canary vs stable without knowing which controller
+# produced the pod.
+#   - Argo Rollouts pods carry  rollouts_pod_template_hash
+#   - plain Deployment pods carry pod_template_hash
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: app-canary
+  namespace: monitoring
+  labels:
+    release: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - app-canary
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_rollouts_pod_template_hash]
+          targetLabel: version
+          action: replace
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          targetLabel: app
+          action: replace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: app-bluegreen
+  namespace: monitoring
+  labels:
+    release: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - app-bluegreen
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_rollouts_pod_template_hash]
+          targetLabel: version
+          action: replace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: app-dev
+  namespace: monitoring
+  labels:
+    release: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - app-dev
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      relabelings:
+        # dev runs a plain Deployment, so the hash label has the other name.
+        - sourceLabels: [__meta_kubernetes_pod_label_pod_template_hash]
+          targetLabel: version
+          action: replace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: argo-rollouts
+  namespace: monitoring
+  labels:
+    release: observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - argo-rollouts
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argo-rollouts
+  endpoints:
+    - port: metrics
+      interval: 30s
