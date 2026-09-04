@@ -13,9 +13,18 @@ stages:
       - name: Classify changed paths (monorepo path discipline)
         id: filter
         run: |
-          set -euo pipefail
-          BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
-          CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+          set -uo pipefail
+          # `git rev-parse HEAD~1` prints TWO lines on a shallow checkout (the
+          # error plus the resolved sha), and interpolating both produced
+          # "fatal: ambiguous argument 'HEAD~1\n<sha>'". Resolve the parent
+          # explicitly and fall back to an empty diff when there isn't one.
+          BASE="$(git rev-parse --verify --quiet 'HEAD^' || true)"
+          if [ -n "$BASE" ]; then
+            CHANGED="$(git diff --name-only "$BASE" HEAD || true)"
+          else
+            echo "No parent commit (shallow or initial) — treating as a full build."
+            CHANGED="$(git ls-files || true)"
+          fi
           echo "changed files:"; echo "$CHANGED"
           app=false; chart=false
           echo "$CHANGED" | grep -qE '^app/'   && app=true   || true
@@ -72,8 +81,6 @@ stages:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-      # The official action rather than `curl | bash`: version-pinned, cached,
-      # and it does not need sudo to write into /usr/local/bin.
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.3
@@ -143,10 +150,6 @@ stages:
       AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
       AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
       AWS_REGION: us-east-1
-      # Trivy v0.58.1's install script exits non-zero on the current
-      # ubuntu-24.04 runner image (it resolves the release, then fails placing
-      # the binary). v0.63.0 installs correctly there.
-      TRIVY_VERSION: v0.63.0
     outputs:
       image_tag: "${{ steps.meta.outputs.image_tag }}"
     steps:
@@ -154,16 +157,20 @@ stages:
         id: meta
         run: echo "image_tag=git-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
       - name: Login to ECR
+        id: ecr
         run: |
           set -euo pipefail
           ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
+          # Export the full repository URL so the scan action can reference it.
+          # It embeds the account id but NOT the project name, so it is not
+          # secret-derived and survives as a step output.
+          echo "repo=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_OUTPUT"
       - name: Build (immutable tag, no reuse)
         run: |
           set -euo pipefail
-          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-          REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.PROJECT_NAME }}"
+          REPO="${{ steps.ecr.outputs.repo }}/${{ secrets.PROJECT_NAME }}"
           TAG="${{ steps.meta.outputs.image_tag }}"
           if aws ecr describe-images --repository-name "${{ secrets.PROJECT_NAME }}" \
                --image-ids imageTag="$TAG" >/dev/null 2>&1; then
@@ -172,25 +179,22 @@ stages:
           # Context is the repo ROOT: app/ is an npm workspace and the lockfile
           # that `npm ci` needs lives at the root, outside ./app.
           docker build -f app/Dockerfile -t "$REPO:$TAG" .
+      # The official action ships its own trivy binary. The contrib install.sh
+      # resolved the release and then exited 1 on this runner image for BOTH
+      # v0.58.1 and v0.63.0 — the version was never the variable, so the whole
+      # install mechanism is removed rather than re-pinned again.
       - name: Scan the image BEFORE it is pushed
-        run: |
-          set -euo pipefail
-          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-          REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.PROJECT_NAME }}"
-          # Install into $HOME: the runner's /usr/local/bin needs sudo.
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b "$HOME/.local/bin" "$TRIVY_VERSION"
-          # Prove the binary is actually there before relying on it — the
-          # installer can resolve a release and still fail to place it.
-          "$HOME/.local/bin/trivy" --version
-          "$HOME/.local/bin/trivy" image --severity HIGH,CRITICAL --exit-code 1 \
-            --ignore-unfixed "$REPO:${{ steps.meta.outputs.image_tag }}"
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ steps.ecr.outputs.repo }}/${{ secrets.PROJECT_NAME }}:${{ steps.meta.outputs.image_tag }}"
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
       - name: Push
         run: |
           set -euo pipefail
-          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-          REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.PROJECT_NAME }}"
+          REPO="${{ steps.ecr.outputs.repo }}/${{ secrets.PROJECT_NAME }}"
           docker push "$REPO:${{ steps.meta.outputs.image_tag }}"
 
   - id: provision
@@ -384,10 +388,11 @@ stages:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
-          curl -sSL -o "$HOME/.local/bin/kubectl-argo-rollouts" \
+          curl -fsSL -o "$HOME/.local/bin/kubectl-argo-rollouts" \
             https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64
           chmod +x "$HOME/.local/bin/kubectl-argo-rollouts"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kubectl-argo-rollouts" version
       - name: Undo to the previous revision
         run: |
           set -euo pipefail
