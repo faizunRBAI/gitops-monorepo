@@ -130,6 +130,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: us-east-1
+      TRIVY_VERSION: v0.63.0
     timeout-minutes: 25
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
@@ -158,9 +159,11 @@ jobs:
         \ --output text)\"\nREPO=\"$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/${{\
         \ secrets.PROJECT_NAME }}\"\n# Install into $HOME: the runner's /usr/local/bin\
         \ needs sudo.\nmkdir -p \"$HOME/.local/bin\"\ncurl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh\
-        \ \\\n  | sh -s -- -b \"$HOME/.local/bin\" v0.58.1\n\"$HOME/.local/bin/trivy\"\
-        \ image --severity HIGH,CRITICAL --exit-code 1 \\\n  --ignore-unfixed \"$REPO:${{\
-        \ steps.meta.outputs.image_tag }}\"\n"
+        \ \\\n  | sh -s -- -b \"$HOME/.local/bin\" \"$TRIVY_VERSION\"\n# Prove the\
+        \ binary is actually there before relying on it \u2014 the\n# installer can\
+        \ resolve a release and still fail to place it.\n\"$HOME/.local/bin/trivy\"\
+        \ --version\n\"$HOME/.local/bin/trivy\" image --severity HIGH,CRITICAL --exit-code\
+        \ 1 \\\n  --ignore-unfixed \"$REPO:${{ steps.meta.outputs.image_tag }}\"\n"
     - name: Push
       run: 'set -euo pipefail
 
